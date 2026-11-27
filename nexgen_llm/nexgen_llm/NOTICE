@@ -1,0 +1,9 @@
+nexgen-llm 0.4.0
+
+src/spm.rs is a port of the SentencePiece tokenizer from the Rust "llama" crate, itself a port of
+Meta's Llama 2 reference code (Copyright (c) Meta Platforms, Inc. and affiliates). That file keeps
+Meta's copyright header and remains subject to the Llama 2 Community License Agreement
+(LICENSE-LLAMA2) and its Acceptable Use Policy (USE_POLICY-LLAMA2.md). The Llama-2 chat layout and
+the [INST]/<<SYS>> tag guard in src/chat.rs follow Meta's reference chat_completion behaviour.
+The rest of the crate is the burn-llm 0.3 code base. Review the license terms for your use before
+redistributing.

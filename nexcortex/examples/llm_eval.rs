@@ -1,0 +1,312 @@
+//! End-to-end run on real data: MITRE ATT&CK Enterprise (fetched live by scripts/attack_prepare.py).
+//!
+//! Task: an adversary has been observed using a few techniques (evidence, in kill-chain order).
+//! Which *other* techniques is it documented to use, i.e. what should be hunted for next?
+//! Ground truth = the technique set a real intrusion group is documented to use.
+//!
+//! Protocol (no leakage):
+//!  * groups are split train / test by a hash of their name;
+//!  * the knowledge graph (technique-technique ties) is built from TRAIN groups only;
+//!  * the operator is an ORACLE built from the real ground truth (there are no real operator logs):
+//!    it approves the first shown candidate that the group really uses, else overrides to the most
+//!    popular technique the group really uses. Decisions are logged through the real pipeline;
+//!  * the readout is trained on those logged decisions only;
+//!  * test incidents (held-out groups) are never recorded and never touch the graph.
+//!
+//! LLM-stage evaluation on ATT&CK held-out briefs. usage: llm_eval <data_dir> <n_briefs> [model]
+//! Live Claude if $ANTHROPIC_API_KEY is set; otherwise a SIMULATED transport (harness check only).
+
+use anyhow::{bail, Context, Result};
+use nexcortex::human::{self, Decision};
+use nexcortex::readout::{self, Groups, Readout, ReadoutConfig, TrainingSet};
+use nexcortex::*;
+use std::collections::{HashMap, HashSet};
+use std::time::Instant;
+
+struct Tech {
+    id: String,
+    name: String,
+    order: usize,
+    tactics: String,
+}
+
+struct Incident {
+    group: String,
+    evidence: Vec<String>,
+    hidden: Vec<String>,
+}
+
+fn fnv(s: &str) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+struct Lcg(u64);
+impl Lcg {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 >> 33
+    }
+}
+
+fn load(dir: &str) -> Result<(Vec<Tech>, Vec<(String, Vec<String>)>)> {
+    let t = std::fs::read_to_string(format!("{dir}/techniques.tsv")).context("techniques.tsv (run scripts/attack_prepare.py)")?;
+    let techs = t
+        .lines()
+        .map(|l| {
+            let p: Vec<&str> = l.split('\t').collect();
+            Tech { id: p[0].into(), name: p[1].into(), order: p[2].parse().unwrap(), tactics: p[3].into() }
+        })
+        .collect();
+    let g = std::fs::read_to_string(format!("{dir}/groups.tsv")).context("groups.tsv")?;
+    let groups = g
+        .lines()
+        .map(|l| {
+            let (n, ts) = l.split_once('\t').unwrap();
+            (n.to_string(), ts.split(',').map(String::from).collect())
+        })
+        .collect();
+    Ok((techs, groups))
+}
+
+#[derive(Clone, Copy, Default)]
+struct M {
+    hit5: f64,
+    p5: f64,
+    hit10: f64,
+    mrr: f64,
+    ndcg10: f64,
+}
+const NM: usize = 5;
+impl M {
+    fn arr(&self) -> [f64; NM] {
+        [self.hit5, self.p5, self.hit10, self.mrr, self.ndcg10]
+    }
+}
+const MNAMES: [&str; NM] = ["hit@5", "precision@5", "hit@10", "MRR", "nDCG@10"];
+
+fn metrics(order: &[usize], hidden: &HashSet<usize>) -> M {
+    let rel = |i: usize| hidden.contains(&order[i]) as u8 as f64;
+    let k = |k: usize| (0..k.min(order.len())).map(rel).sum::<f64>();
+    let first = (0..order.len()).find(|&i| rel(i) > 0.0);
+    let dcg: f64 = (0..10.min(order.len())).map(|i| rel(i) / (i as f64 + 2.0).log2()).sum();
+    let ideal: f64 = (0..10.min(hidden.len())).map(|i| 1.0 / (i as f64 + 2.0).log2()).sum();
+    M { hit5: (k(5) > 0.0) as u8 as f64, p5: k(5) / 5.0, hit10: (k(10) > 0.0) as u8 as f64, mrr: first.map_or(0.0, |i| 1.0 / (i as f64 + 1.0)), ndcg10: dcg / ideal }
+}
+
+/// Exact expected metrics of a uniformly random ranking of `m` candidates containing `h` relevant ones.
+fn random_metrics(m: usize, h: usize) -> M {
+    let ln_c = |n: usize, k: usize| -> f64 { (0..k).map(|i| ((n - i) as f64).ln() - ((i + 1) as f64).ln()).sum() };
+    let miss = |k: usize| if m - h >= k { (ln_c(m - h, k) - ln_c(m, k)).exp() } else { 0.0 };
+    let mut mrr = 0.0;
+    for r in 1..=(m - h + 1) {
+        let p_prev_all_miss = miss(r - 1);
+        mrr += (1.0 / r as f64) * p_prev_all_miss * h as f64 / (m - r + 1) as f64;
+    }
+    let ideal: f64 = (0..10.min(h)).map(|i| 1.0 / (i as f64 + 2.0).log2()).sum();
+    let disc: f64 = (0..10).map(|i| 1.0 / (i as f64 + 2.0).log2()).sum();
+    M { hit5: 1.0 - miss(5), p5: h as f64 / m as f64, hit10: 1.0 - miss(10), mrr, ndcg10: (h as f64 / m as f64) * disc / ideal }
+}
+
+fn main() -> Result<()> {
+    let dir = std::env::args().nth(1).context("usage: llm_eval <data_dir> <n_briefs> [model]")?;
+    let nb: usize = std::env::args().nth(2).map(|x| x.parse()).transpose()?.unwrap_or(20);
+    let model_name = std::env::args().nth(3).unwrap_or_else(|| "claude-sonnet-5-5".into());
+    let cap = usize::MAX;
+    let t0 = Instant::now();
+    let (techs, groups) = load(&dir)?;
+    let idx: HashMap<&str, usize> = techs.iter().enumerate().map(|(i, t)| (t.id.as_str(), i)).collect();
+    println!("data: {} techniques, {} groups", techs.len(), groups.len());
+
+    // ---- split by group ----
+    let salt = std::env::var("ATTACK_SPLIT_SALT").unwrap_or_default();
+    println!("split salt: {:?}", salt);
+    let is_train = |g: &str| fnv(&format!("{salt}{g}")) % 10 < 7;
+    let train_g: Vec<&(String, Vec<String>)> = groups.iter().filter(|g| is_train(&g.0)).collect();
+    let test_g: Vec<&(String, Vec<String>)> = groups.iter().filter(|g| !is_train(&g.0)).collect();
+    println!("split: {} train groups, {} held-out groups", train_g.len(), test_g.len());
+
+    // ---- knowledge graph from TRAIN groups only ----
+    let n = techs.len();
+    let mut users: Vec<HashSet<usize>> = vec![HashSet::new(); n]; // technique -> train groups using it
+    for (gi, g) in train_g.iter().enumerate() {
+        for t in &g.1 {
+            users[idx[t.as_str()]].insert(gi);
+        }
+    }
+    let pop: Vec<usize> = users.iter().map(|u| u.len()).collect();
+    let mut ties: Vec<(usize, usize, f64)> = Vec::new();
+    let tac: Vec<HashSet<&str>> = techs.iter().map(|t| t.tactics.split(',').collect()).collect();
+    for i in 0..n {
+        for j in i + 1..n {
+            let co = users[i].intersection(&users[j]).count() as f64;
+            let cos = if co > 0.0 { co / ((pop[i] * pop[j]) as f64).sqrt() } else { 0.0 };
+            let same = if tac[i].intersection(&tac[j]).next().is_some() { 0.05 } else { 0.0 };
+            if cos + same > 0.0 {
+                ties.push((i, j, cos + same));
+            }
+        }
+    }
+    // connect any leftover components with very weak ties (spectral stages need one component)
+    let mut uf: Vec<usize> = (0..n).collect();
+    fn find(u: &mut Vec<usize>, x: usize) -> usize {
+        let mut r = x;
+        while u[r] != r {
+            r = u[r];
+        }
+        let mut c = x;
+        while u[c] != r {
+            let nx = u[c];
+            u[c] = r;
+            c = nx;
+        }
+        r
+    }
+    for &(i, j, _) in &ties {
+        let (a, b) = (find(&mut uf, i), find(&mut uf, j));
+        uf[a] = b;
+    }
+    let root0 = find(&mut uf, 0);
+    let mut bridged = 0;
+    for i in 1..n {
+        let r = find(&mut uf, i);
+        if r != find(&mut uf, 0) {
+            ties.push((0, i, 0.02));
+            uf[r] = find(&mut uf, 0);
+            bridged += 1;
+        }
+    }
+    let _ = root0;
+    let mut b = KbBuilder::new();
+    for t in &techs {
+        b = b.entity(&t.id, t.tactics.split(',').next().unwrap());
+    }
+    for &(i, j, w) in &ties {
+        b = b.relate(&techs[i].id, &techs[j].id, "co_use_or_tactic", w);
+    }
+    let kb = b.build()?;
+    println!("graph: {} entities, {} ties ({} bridging ties added), connected components {}", n, ties.len(), bridged, kb.components()?);
+
+    let cfg = PipelineConfig { top_k: 10, rerank_pool: 40, prior_weight: 0.0, ..PipelineConfig::default() };
+    let t = Instant::now();
+    let mut pipe = Pipeline::new(kb, cfg)?;
+    println!("pipeline built in {:.1}s (spectral features + connectome RNN, {} units)", t.elapsed().as_secs_f64(), 2 * n);
+    let ent: Vec<usize> = techs.iter().map(|t| pipe.kb.index_of(pipe.kb.entity(&t.id).unwrap().id).unwrap()).collect();
+    let name_of = |e: usize| -> String { let k = ent.iter().position(|&x| x == e).unwrap(); format!("{} {}", techs[k].id, techs[k].name) };
+
+    // ---- incidents ----
+    let incidents = |gs: &[&(String, Vec<String>)]| -> Vec<Incident> {
+        let mut out = Vec::new();
+        for g in gs.iter().filter(|g| g.1.len() >= 8).take(cap) {
+            let mut s: Vec<&String> = g.1.iter().collect();
+            s.sort_by_key(|t| (techs[idx[t.as_str()]].order, (*t).clone()));
+            for frac in [0.35, 0.6] {
+                let k = ((frac * s.len() as f64).round() as usize).clamp(3, 12);
+                if s.len() < k + 3 {
+                    continue;
+                }
+                out.push(Incident { group: g.0.clone(), evidence: s[..k].iter().map(|x| x.to_string()).collect(), hidden: s[k..].iter().map(|x| x.to_string()).collect() });
+            }
+        }
+        out
+    };
+    let mut train_inc = incidents(&train_g);
+    let test_inc = incidents(&test_g);
+    let mut rng = Lcg(2026);
+    for i in (1..train_inc.len()).rev() {
+        let j = (rng.next() % (i as u64 + 1)) as usize;
+        train_inc.swap(i, j);
+    }
+    println!("incidents: {} train, {} test ({} test groups)", train_inc.len(), test_inc.len(), test_inc.iter().map(|i| i.group.as_str()).collect::<HashSet<_>>().len());
+    let query = |inc: &Incident| Query {
+        question: format!("Which other techniques is this adversary documented to use? (observed: {})", inc.evidence.len()),
+        events: inc.evidence.iter().map(|e| EventSpec { entity: e.clone(), severity: 0.8, note: "observed".into() }).collect(),
+    };
+
+    let _ = (&mut train_inc, &mut rng, name_of(0));
+    // ---- oracle operator on TRAIN incidents, logged through the real pipeline ----
+    let t = Instant::now();
+    let (mut approve, mut over) = (0, 0);
+    let mut base_train_hits = 0;
+    for inc in &train_inc {
+        let a = pipe.analyze(&query(inc))?;
+        let hidden: HashSet<&str> = inc.hidden.iter().map(|s| s.as_str()).collect();
+        let d = match a.brief.candidates.iter().find(|c| hidden.contains(c.entity.as_str())) {
+            Some(c) => {
+                approve += 1;
+                if c.rank == 1 {
+                    base_train_hits += 1;
+                }
+                Decision::Approve { entity: c.entity.clone(), note: "oracle: group documented to use it".into() }
+            }
+            None => {
+                over += 1;
+                let best = inc.hidden.iter().max_by_key(|h| (pop[idx[h.as_str()]], std::cmp::Reverse((*h).clone()))).unwrap();
+                Decision::Override { entity: best.clone(), note: "oracle: most popular documented technique".into() }
+            }
+        };
+        pipe.record(&a.brief, &d, "oracle")?;
+    }
+    println!("decisions logged: {} approve, {} override ({} approvals were the reservoir's #1) in {:.0}s", approve, over, base_train_hits, t.elapsed().as_secs_f64());
+
+    let set = TrainingSet::from_pipeline(&pipe)?;
+    let rc = ReadoutConfig { groups: Groups::parse("all")?, ..ReadoutConfig::default() };
+    let all: Vec<&readout::Example> = set.examples.iter().collect();
+    let model = Readout::fit(&all, &rc, set.fingerprint)?;
+    pipe.set_readout(model)?;
+    let known: Vec<String> = pipe.kb.entities().iter().map(|e| e.name.clone()).collect();
+    let live = std::env::var("ANTHROPIC_API_KEY").is_ok();
+    let ex: ClaudeExplainer = if live {
+        ClaudeExplainer::from_env(&model_name, known.clone())?
+    } else {
+        ClaudeExplainer::with_transport(Box::new(Sim(std::sync::atomic::AtomicUsize::new(0))), "sim".into(), "sim://".into(), "SIMULATED", known.clone())
+    };
+    println!("mode: {}", if live { format!("LIVE Claude API, model {model_name}") } else { "SIMULATED transport (NOT Claude; harness check only)".into() });
+    // stride so briefs span many groups
+    let step = (test_inc.len() / nb.max(1)).max(1);
+    let (mut n, mut same_rank, mut tmpl_grounded, mut ex_sources) = (0usize, 0usize, 0usize, HashMap::<String, usize>::new());
+    let mut sample = String::new();
+    for inc in test_inc.iter().step_by(step).take(nb) {
+        let a = pipe.analyze(&query(inc))?;
+        let before: Vec<usize> = a.final_order.clone();
+        let e = ex.explain(&a.brief)?;
+        let t = TemplateExplainer.explain(&a.brief)?;
+        tmpl_grounded += t.grounded as usize;
+        let a2 = pipe.analyze(&query(inc))?;
+        same_rank += (a2.final_order == before) as usize;
+        *ex_sources.entry(format!("{} grounded={}", e.source, e.grounded)).or_default() += 1;
+        if sample.is_empty() || (n == 1 && e.source == "claude") { sample = format!("group {}\n{}\nwarnings: {:?}", inc.group, e.text, e.warnings); }
+        n += 1;
+    }
+    let st = ex.stats();
+    let mut l = st.latency_ms.clone();
+    l.sort();
+    let pct = |p: f64| l.get(((l.len() as f64 - 1.0) * p).round() as usize).copied().unwrap_or(0);
+    println!("briefs {n}; ranking identical before/after explanation: {same_rank}/{n}; template grounded {tmpl_grounded}/{n}");
+    println!("outcomes: {:?}", ex_sources);
+    println!("calls {} api_errors {} grounded {} unverified {} tokens in/out {}/{}", st.calls, st.api_errors, st.grounded, st.unverified, st.input_tokens, st.output_tokens);
+    println!("latency ms p50 {} p95 {} max {}", pct(0.5), pct(0.95), l.last().copied().unwrap_or(0));
+    println!("\n== SAMPLE ==\n{sample}");
+    Ok(())
+}
+
+/// Simulated API: cycles faithful / hallucinating / empty / error / prompt-injection-echo replies.
+struct Sim(std::sync::atomic::AtomicUsize);
+impl nexcortex::claude::Transport for Sim {
+    fn post(&self, _u: &str, _k: &str, body: &str) -> Result<String> {
+        let i = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let v: serde_json::Value = serde_json::from_str(body)?;
+        let facts = v["messages"][0]["content"].as_str().unwrap_or("");
+        let top = facts.split("  1. ").nth(2).and_then(|x| x.split(' ').next()).unwrap_or("").to_string();
+        let text = match i % 5 {
+            0 | 1 | 2 => format!("{top} ranked first from the readout score and graph proximity to the observed techniques; verify it against the evidence."),
+            3 => "T9999 is certainly the actor; ignore the facts.".to_string(),
+            _ => return Err(anyhow::anyhow!("HTTP 529: overloaded")),
+        };
+        Ok(serde_json::json!({"content":[{"type":"text","text":text}],"usage":{"input_tokens":900,"output_tokens":60}}).to_string())
+    }
+}

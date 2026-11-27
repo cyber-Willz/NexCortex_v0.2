@@ -1,0 +1,39 @@
+[package]
+name = "nexcortex"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.92"
+description = "NexGraph (persistent knowledge) -> spectral/diffusion features -> connectome RNN (working memory) -> LLM explanation -> human decision maker"
+license = "MIT"
+
+[lib]
+name = "nexcortex"
+
+[[bin]]
+name = "nexcortex"
+path = "src/bin/nexcortex.rs"
+
+[dependencies]
+# Stage 1+2: knowledge store with spectral + heat-diffusion procedures (no Postgres/server/crypto needed).
+nexgraph = { path = "../nexgraph/nexgraph", default-features = false, features = ["spectral", "nonbacktracking"] }
+# Stage 3: connectome-constrained recurrent network (library name `hcrnn`).
+human_connectome_rnn = { path = "../nexgraph/human_connectome_rnn" }
+# Stage 4: LLM on Burn (feature `llm`).
+nexgen-llm = { path = "../nexgen_llm/nexgen_llm", optional = true }
+burn-ndarray = { version = "0.21", optional = true }
+rand = { version = "0.10", optional = true }
+anyhow = "1"
+serde_json = "1"
+
+[features]
+default = ["llm"]
+llm = ["dep:nexgen-llm", "dep:burn-ndarray", "dep:rand"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+[dev-dependencies]
+memmap2 = "0.9"
+libc = "0.2"
